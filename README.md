@@ -335,89 +335,228 @@ erDiagram
 ## **6. Физическая схема БД**
 
 ```mermaid
-graph TB
-    subgraph "PostgreSQL"
-        PG[users, meetings, meeting_invite_links, recordings]
-    end
+erDiagram
+    users ||--o{ meetings : owns
+    meetings ||--o{ meeting_invite_links : has
+    meetings ||--o{ meeting_participants : has
+    meetings ||--|| meetings_runtime : runtime_state
+    users ||--o{ user_meetings : has
+    meetings ||--o{ user_meetings : appears_in
+    meetings ||--o{ chat_messages : has
+    users ||--o{ chat_messages : writes
+    meetings ||--o{ recordings : has
+    users ||--o{ user_sessions : has
 
-    subgraph "Cassandra"
-        CASS[chat_messages, meeting_participants, user_meetings, meetings_runtime]
-    end
-
-    subgraph "Redis"
-        REDIS[user_sessions]
-    end
-
-    subgraph "Object Storage"
-        OBJ[файлы записей]
-    end
+    users {
+        uuid id PK
+        varchar email UK
+        varchar password_hash
+        varchar name
+        datetime created_at
+    }
+    meetings {
+        uuid meeting_id PK
+        uuid owner_id
+        varchar topic
+        datetime scheduled_start
+        varchar status
+    }
+    meeting_invite_links {
+        uuid meeting_id PK
+        varchar token UK
+        datetime expires_at
+        boolean revoked
+    }
+    meeting_participants {
+        uuid meeting_id PK
+        uuid user_id PK
+        boolean is_online
+        datetime last_joined_at
+        datetime last_left_at
+    }
+    user_meetings {
+        uuid user_id PK
+        datetime scheduled_start PK
+        uuid meeting_id
+        varchar status
+    }
+    meetings_runtime {
+        uuid meeting_id PK
+        integer participants_online_count
+        integer participants_total_count
+    }
+    chat_messages {
+        uuid meeting_id PK
+        datetime created_at PK
+        uuid message_id
+        uuid user_id
+        text body
+    }
+    recordings {
+        uuid meeting_id PK
+        datetime created_at PK
+        varchar storage_url
+        bigint size_bytes
+    }
+    user_sessions {
+        varchar session_id PK
+        uuid user_id
+        datetime expires_at
+    }
 ```
 
-### **Выбор СУБД**
+### **Размещение данных по СУБД**
 
-| Данные | СУБД | Почему так |
+| Таблица | СУБД | Причина |
 |---|---|---|
-| `users`, `meetings`, `meeting_invite_links`, `recordings` | PostgreSQL | Нужны строгие ограничения для пользователей, встреч и инвайтов |
-| `chat_messages`, `meeting_participants`, `user_meetings`, `meetings_runtime` | Cassandra | Большие объемы, много записи, чтение по ключам `meeting_id` и `user_id` |
-| `user_sessions` | Redis | Сессии с TTL |
-| Файлы записей | Object Storage | Бинарные данные и репликация |
+| `users` | PostgreSQL | строгие ограничения и уникальность email |
+| `meetings`, `meeting_invite_links`, `meeting_participants`, `user_meetings`, `meetings_runtime`, `chat_messages`, `recordings` | Cassandra | высокая запись, горизонтальное масштабирование, чтение по ключу |
+| `user_sessions` | Redis | быстрые сессии с TTL |
+| файлы записей | Object Storage | большие бинарные объекты |
 
-### **Индексы**
+### **Индексы и их размер**
 
-| Таблица | Индекс | Для чего |
-|---|---|---|
-| `users` | по `email` | поиск пользователя при входе |
-| `meeting_invite_links` | уникальный по `token` | валидация инвайта |
-| `meeting_invite_links` | по `meeting_id` | получение инвайтов для встречи |
-| `meetings` | по `owner_id` и `scheduled_start` | список встреч и ближайшие встречи |
-| `recordings` | по `meeting_id` | список записей для встречи |
-| `chat_messages` | partition `meeting_id`, сортировка по `created_at` | история чата по встрече |
-| `meeting_participants` | partition `meeting_id` | список участников встречи |
-| `user_meetings` | partition `user_id` | список встреч пользователя |
-| `meetings_runtime` | partition `meeting_id` | открытие встречи |
+| Таблица | Индекс / ключ | Оценка размера индекса | Обоснование |
+|---|---|---|---|
+| `users` | PostgreSQL B-tree по `email` | ~20 ГБ (500 млн строк * ~40 B) | вход по email |
+| `meetings` | Cassandra PK `((meeting_id))` | ~29 ГБ (1.8 млрд * ~16 B) | точечное чтение встречи |
+| `meeting_invite_links` | Cassandra PK `((meeting_id), token)` | ~43 ГБ (1.8 млрд * ~24 B) | проверка инвайта внутри встречи |
+| `meeting_participants` | Cassandra PK `((meeting_id), user_id)` | ~432 ГБ (18 млрд * ~24 B) | список участников встречи |
+| `user_meetings` | Cassandra PK `((user_id), scheduled_start)` | ~432 ГБ (18 млрд * ~24 B) | список встреч пользователя |
+| `meetings_runtime` | Cassandra PK `((meeting_id))` | ~29 ГБ (1.8 млрд * ~16 B) | открытие встречи |
+| `chat_messages` | Cassandra PK `((meeting_id), created_at, message_id)` | ~5 ТБ (180 млрд * ~28 B) | история чата по времени |
+| `recordings` | Cassandra PK `((meeting_id), created_at)` | ~35 ГБ (2.19 млрд * ~16 B) | список записей встречи |
+| `user_sessions` | Redis key `session_id` | ~20-30 ГБ | проверка сессии |
 
 ### **Шардирование**
 
-| Таблица | Подход | Почему шардируем |
+| Таблица | Ключ шардирования | Почему |
 |---|---|---|
-| `meetings` | шардирование по `meeting_id` | 60,000,000 встреч в день, за 30 дней 1,800,000,000 строк, запись ~700,000 QPS и объем ~238 ГБ, шардирование снижает нагрузку на запись и объем данных на один узел пропорционально числу шардов |
-| `meeting_invite_links` | шардирование по `meeting_id` | 60,000,000 инвайтов в день, за 30 дней 1,800,000,000 строк, запись ~700,000 QPS и объем ~198 ГБ, шардирование снижает нагрузку на запись и объем данных на один узел пропорционально числу шардов |
+| `meetings` | `meeting_id` | 60,000,000 встреч в день и ~700,000 QPS на запись, нагрузка делится между шардами |
+| `meeting_invite_links` | `meeting_id` | 60,000,000 инвайтов в день и ~700,000 QPS на запись, проверки токенов распределяются по шардам |
+| `meeting_participants` | `meeting_id` | 600,000,000 участий в день, основное чтение и запись локальны для одной встречи |
+| `user_meetings` | `user_id` | 18,000,000,000 строк за 30 дней, список встреч читается по пользователю |
+| `chat_messages` | `meeting_id` | 6,000,000,000 сообщений в день, история читается по встрече |
 
 ### **Партиционирование**
 
-| Таблица | Партиционирование | Почему партиционируем |
+| Таблица | Подход | Почему |
 |---|---|---|
-| `chat_messages` | по месяцу по `created_at` | 6 млрд сообщений в сутки, нужно быстро удалять старое по TTL |
+| `chat_messages` | партиция по месяцу `created_at` | 180 млрд строк за 30 дней, нужна быстрая очистка TTL |
+| `recordings` | партиция по месяцу `created_at` | 2.19 млрд строк в год, проще архив и очистка старых данных |
 
 ### **Резервирование**
 
-- PostgreSQL: реплика с аварийным переключением  
-- Cassandra: replication factor 3 в регионе, межрегиональная асинхронная репликация  
-- Redis: реплика и аварийное переключение  
-- Object Storage: репликация данных на нескольких узлах
+- Cassandra: RF=3 в регионе + асинхронная межрегиональная репликация  
+- PostgreSQL: primary + replica  
+- Redis: master + replica  
+- Object Storage: репликация объектов
 
 ## **7. Алгоритмы**
 
-| Алгоритм | Область применения | Обоснование |
-|----------|-------------------|-------------|
-| Active Speaker Detection | выбор активного спикера и отображение видео | определяем кто говорит по уровню и стабильности аудио и именно его выводим основным |
-| Adaptive Bitrate | качество видео при изменении сети | если канал просел снижаем качество видео чтобы связь не рвалась |
-| Jitter Buffer | аудио и видео | пакеты приходят неровно буфер держит небольшой запас и выдает ровно по времени |
-| A/V Sync | воспроизведение аудио и видео | выравниваем звук и картинку по меткам времени чтобы не было рассинхрона |
-| Идемпотентные события join/leave | статусы участников и счетчики | повторы событий из за сети считаем как одно действие чтобы счетчики online не ломались |
+| Алгоритм | Где используется | Коротко |
+|----------|------------------|---------|
+| Active Speaker Detection | отображение участников | определяем кто сейчас говорит и выводим его главным |
+| Adaptive Bitrate | видеопоток | автоматически меняем качество под канал |
+| Jitter Buffer | аудио и видео | сглаживаем неровную доставку пакетов |
+| A/V Sync | воспроизведение | выравниваем звук и видео по времени |
+| Идемпотентные join/leave | статусы участников | повторные события не ломают счетчики |
+
+### **Подробно: Adaptive Bitrate**
+
+1. Клиент каждую секунду отправляет метрики сети: потери пакетов, RTT, доступную полосу  
+2. Сервер считает целевой профиль качества (например 1080p, 720p, 480p)  
+3. При ухудшении сети сервер сразу понижает профиль, при улучшении поднимает плавно  
+4. Приоритет всегда у стабильного звука, видео режется первым  
+5. За счет этого звонок не обрывается, а качество меняется ступенчато
+
+```mermaid
+flowchart TD
+    A[Клиент отправляет метрики сети] --> B[Сервер оценивает потери, RTT и полосу]
+    B --> C{Сеть стабильна?}
+    C -- Нет --> D[Понизить профиль качества<br/>1080p -> 720p -> 480p]
+    C -- Да --> E{Есть запас по каналу?}
+    E -- Нет --> F[Оставить текущий профиль]
+    E -- Да --> G[Повысить профиль на одну ступень]
+    D --> H[Проверка качества аудио]
+    F --> H
+    G --> H
+    H --> I{Аудио стабильно?}
+    I -- Нет --> J[Сначала стабилизировать аудио,<br/>видео снизить]
+    I -- Да --> K[Применить профиль и продолжить звонок]
+    J --> A
+    K --> A
+```
 
 ## **8. Технологии**
 
-| Технология | Область применения | Мотивация |
-|------------|-------------------|----------|
-| NGINX | L7 балансировка, HTTPS, WebSocket | много долгоживущих соединений и высокий RPS |
-| L4 балансировщик | распределение соединений на пул NGINX | входной трафик распределяется на несколько L7 |
-| PostgreSQL | пользователи, встречи, инвайты, метаданные записей | ограничения, уникальность токенов, индексы под запросы |
-| Cassandra | чат и рантайм-таблицы по встречам и пользователям | большие объемы и высокая запись (десятки TB для чата) |
-| Redis | сессии | TTL и быстрый доступ |
-| Object Storage | файлы записей встреч | большие бинарные данные и дешевое масштабирование |
-| Kafka или RabbitMQ | обновление денорм таблиц, счетчиков, фоновые задачи | отделяет рантайм от фоновых пересчетов |
-| Kubernetes | запуск и масштабирование сервисов | горизонтальное масштабирование под пик |
+| Технология | Где | Почему |
+|------------|-----|--------|
+| React + TypeScript | фронтенд | быстрое обновление UI и типобезопасность |
+| Go | бекенд | высокая конкурентность и стабильная работа при большом числе соединений |
+| NGINX | L7 | HTTPS и WebSocket проксирование |
+| L4 балансировщик | вход в ДЦ | распределяет входящие соединения по пулу NGINX |
+| Cassandra | высоконагруженные таблицы | много записи и горизонтальное масштабирование |
+| PostgreSQL | аккаунты пользователей | строгие ограничения и транзакции |
+| Redis | сессии и горячий кеш | быстрые чтения и TTL |
+| Object Storage (S3) | файлы записей | дешево хранить большой бинарный объем |
+| Kafka | потоковые события, денормализация, фоновые воркеры | высокий throughput при больших потоках, хранение событий и повторное чтение |
+
+Выбор между Kafka и RabbitMQ:
+
+- Kafka: потоковый лог, высокая пропускная способность, хранит события и позволяет читать их повторно
+- RabbitMQ: классическая очередь задач, сообщение обычно забрали и удалили, replay ограничен
+- Для этого проекта выбираем Kafka, потому что нужно одновременно вести поток событий, обновлять денорм таблицы и переигрывать события при сбоях воркеров
+
+## **10. Схема проекта**
+
+```mermaid
+graph TB
+    U[Web/Mobile Client] --> DNS[GeoDNS]
+    DNS --> L4[L4 балансировщик региона]
+    L4 --> L7[NGINX L7]
+
+    L7 --> API[API сервисы]
+    L7 --> SIG[Signaling сервис]
+    L7 --> CHAT[Chat сервис]
+
+    API --> CASS[(Cassandra)]
+    SIG --> CASS
+    CHAT --> CASS
+    API --> PG[(PostgreSQL users)]
+    API --> REDIS[(Redis sessions)]
+
+    API --> MQ[Kafka]
+    MQ --> W1[Worker: денормализация]
+    MQ --> W2[Worker: уведомления]
+    MQ --> W3[Worker: обработка записи]
+
+    W3 --> S3[(Object Storage S3)]
+    U --> S3
+
+    API --> OBS[Логи и метрики]
+    SIG --> OBS
+    CHAT --> OBS
+    W1 --> OBS
+    W2 --> OBS
+    W3 --> OBS
+```
+
+
+## **9. Обеспечение надежности**
+
+| Компонент | Схема резервирования |
+|-----------|----------------------|
+| API и Signaling сервисы | N+1, минимум 2 инстанса в каждой зоне, health-check и автоперезапуск |
+| NGINX L7 | N+1, пул инстансов в 3 зонах, исключение неработающих нод |
+| L4 балансировщик | active-active, трафик идет через несколько инстансов |
+| Cassandra | RF=3 в регионе, асинхронная межрегиональная репликация |
+| PostgreSQL (`users`) | primary + replica, автоматическое переключение при отказе |
+| Redis (`user_sessions`) | master + replica, автоматический failover |
+| Kafka | replication factor=3, `acks=all` для записи |
+| Object Storage (S3) | репликация между зонами |
+| Worker-сервисы | минимум 2 воркера на тип задачи, повторная обработка задач через Kafka |
+| Логи и метрики | отдельный контур хранения, отказ одного узла не останавливает сбор метрик |
 
 ## Источники
 
