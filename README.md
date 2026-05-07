@@ -512,29 +512,36 @@ flowchart TD
 
 ```mermaid
 graph TB
-    U[Web/Mobile Client] --> DNS[GeoDNS]
+    WEB[Web Client] --> DNS[GeoDNS]
+    MOB[Mobile Client] --> DNS
     DNS --> L4[L4 балансировщик региона]
     L4 --> L7[NGINX L7]
 
-    L7 --> API[API сервисы]
-    L7 --> SIG[Signaling сервис]
-    L7 --> CHAT[Chat сервис]
+    L7 --> API[API сервисы sync]
+    L7 --> SIG[Signaling сервис sync]
+    L7 --> CHAT[Chat сервис sync]
 
+    API --> PG[(PostgreSQL users)]
+    API --> REDIS[(Redis sessions)]
     API --> CASS[(Cassandra)]
     SIG --> CASS
     CHAT --> CASS
-    API --> PG[(PostgreSQL users)]
-    API --> REDIS[(Redis sessions)]
 
-    API --> MQ[Kafka]
+    API -.-> MQ[Kafka async]
     MQ --> W1[Worker: денормализация]
     MQ --> W2[Worker: уведомления]
     MQ --> W3[Worker: обработка записи]
 
-    W3 --> S3[(Object Storage S3)]
-    U --> S3
+    W1 --> CASS
+    W2 --> CASS
+    W3 --> CASS
 
-    API --> OBS[Логи и метрики]
+    W3 --> S3[(Object Storage S3)]
+    WEB -->|presigned URL| S3
+    MOB -->|presigned URL| S3
+
+    OBS[Логи и метрики]
+    API --> OBS
     SIG --> OBS
     CHAT --> OBS
     W1 --> OBS
@@ -558,6 +565,79 @@ graph TB
 | Worker-сервисы | минимум 2 воркера на тип задачи, повторная обработка задач через Kafka |
 | Логи и метрики | отдельный контур хранения, отказ одного узла не останавливает сбор метрик |
 
+## **11. Расчет ресурсов**
+
+### Входные цифры
+
+- `chat_messages`: 6,000,000,000 сообщений в день, за 30 дней 180,000,000,000 строк, объем ~54 ТБ
+- индекс `chat_messages`: ~5 ТБ
+- RF=3 для Cassandra
+- запас по диску: 30 процентов
+- оценка производительности Go сервисов: ~3,500 RPS на 1 vCPU (как в `highload_figma`)
+
+### Список серверов
+
+| Компонент | RPS (пик) | CPU (vCPU) | RAM (GB) | Disk | Количество | Обоснование |
+|----------|-----------:|-----------:|---------:|------|-----------:|------------|
+| Chat сервис | 208,000 | 60 | 120 | - | 30 | 208,000 / 3,500 ≈ 60 vCPU, дальше N+1 и 3 зоны |
+| Signaling сервис | 34,800 | 10 | 20 | - | 9 | 34,800 / 3,500 ≈ 10 vCPU, дальше N+1 и 3 зоны |
+| API сервисы | 20,800 | 6 | 12 | - | 9 | 20,800 / 3,500 ≈ 6 vCPU, дальше N+1 и 3 зоны |
+| NGINX L7 | - | - | - | - | 72 | расчет из раздела 4.2 |
+| L4 балансировщик | - | - | - | - | 6 | active-active, по 2 на зону |
+| Kafka | - | 48 | 192 | 6 TB NVMe | 3 | replication factor=3, хранение событий и ретеншн |
+| Redis sessions | - | 16 | 128 | - | 2 | master + replica, все в RAM |
+| PostgreSQL users | - | 32 | 128 | 4 TB NVMe | 2 | primary + replica |
+| Cassandra (основные таблицы) | - | 576 | 2304 | 230 TB NVMe raw | 9 | ниже расчет по диску |
+| Worker: денормализация | - | 16 | 64 | - | 2 | обработка потока событий Kafka |
+| Worker: уведомления | - | 16 | 64 | - | 2 | отправка уведомлений |
+| Worker: обработка записи | - | 32 | 128 | - | 2 | фоновые операции по записи |
+| Логи и метрики | - | 16 | 64 | 4 TB | 2 | отдельный контур |
+
+### Диск Cassandra
+
+- данные + индекс: 54 + 5 = 59 ТБ
+- с RF=3: 59 * 3 = 177 ТБ
+- с запасом 30 процентов: 177 * 1.3 = ~230 ТБ
+
+При конфигурации ноды 8 * 3.84 TB NVMe (30.7 TB raw) нужно:
+
+- 230 / 30.7 = 7.5 нод, округляем до 9 нод
+
+### Аренда или свое железо
+
+Сравнение на 5 лет (60 месяцев), амортизация покупки 20 процентов в год
+
+#### Вариант 1: аренда выделенных серверов (Hetzner)
+
+Берем серверы уровня AX162 как базовую единицу для Cassandra и Kafka воркеров [Hetzner AX Matrix]
+
+- цена: 272.51 EUR в месяц за сервер
+- считаем аренду для всего стека по конфигурациям из таблицы выше: 9 (Cassandra) + 3 (Kafka) + 2 (PostgreSQL) + 2 (Redis) + 72 (NGINX) + 6 (L4) + 6 (workers) + 2 (логи и метрики) = 102 сервера
+- 102 * 272.51 = 27796.02 EUR в месяц
+- за 60 месяцев: 27796.02 * 60 = 1667761.2 EUR
+
+#### Вариант 2: покупка серверов (пример Dell PowerEdge R760)
+
+Берем цену стартовой конфигурации как порядок величины [Dell R760]
+
+- цена: 10899 USD за сервер
+- 102 сервера: 102 * 10899 = 1111698 USD
+- амортизация 5 лет по 20 процентов в год: 1111698 USD
+
+#### Вариант 3: облако (Yandex Cloud)
+
+Для облака считаем по публичным ценам на VM, пример: 4 vCPU и 8 GB RAM стоят 5,838 руб в месяц [Yandex Cloud Pricing 2026]
+
+
+- 1 vCPU в месяц ≈ 5,838 / 4 = 1,459.5 руб
+- Cassandra 576 vCPU ≈ 576 * 1,459.5 = 840,672 руб в месяц
+- за 60 месяцев ≈ 50,440,320 руб
+
+Это без учета дисков и трафика, поэтому облако получается дороже
+
+Вывод: при больших объемах диска аренда выделенных серверов дешевле облака
+
+Итоговый выбор: берем аренду выделенных серверов Hetzner, ориентировочная стоимость 27796.02 EUR в месяц, за 5 лет 1667761.2 EUR
 ## Источники
 
 [Reuters] - «Zoom says it has 300 million daily meeting participants, not users»  
@@ -574,3 +654,15 @@ graph TB
 
 [Zoom Bandwidth Requirements] - официальные рекомендации по пропускной способности для встреч Zoom  
 `https://library.zoom.com/admin-corner/network-management/quality-of-service-and-network-best-practices-explainer/calculating-bandwidth-usage-for-zoom-meetings-and-phone`
+
+[Hetzner AX Matrix] - цены на выделенные серверы AX
+`https://www.hetzner.com/dedicated-rootserver/matrix-ax`
+
+[Dell R760] - стоимость сервера Dell PowerEdge R760
+`https://www.dell.com/en-us/shop/dell-poweredge-servers/poweredge-r760-rack-server/spd/poweredge-r760/pe_r760_15724_vi_vp`
+
+[Yandex Cloud Pricing 2026] - примеры тарифов Yandex Cloud Compute
+`https://toolfox.ru/services/s/yandex-cloud`
+
+[Yandex Object Storage example] - пример стоимости хранения в Yandex Object Storage
+`https://hosting.kitchen/yandex-cloud/kak-deshevo-hranit-dannye-v-yandeksoblake.html`
